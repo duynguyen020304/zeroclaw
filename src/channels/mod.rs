@@ -221,6 +221,7 @@ struct ChannelRuntimeContext {
     multimodal: crate::config::MultimodalConfig,
     hooks: Option<Arc<crate::hooks::HookRunner>>,
     non_cli_excluded_tools: Arc<Vec<String>>,
+    channels_config: Option<crate::config::ChannelsConfig>,
 }
 
 #[derive(Clone)]
@@ -262,6 +263,85 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}", msg.channel, msg.sender)
+}
+
+/// Maximum conversation messages to store per Discord user.
+const MAX_DISCORD_CONVERSATION_HISTORY: usize = 100;
+
+/// Key for storing conversation history for a specific user.
+/// Format: {channel}_conv:{user_id}
+/// This ensures strict isolation between users.
+fn conversation_storage_key(channel: &str, sender: &str) -> String {
+    format!("{}_conv:{}", channel, sender)
+}
+
+/// Save conversation history to memory backend (user-isolated).
+///
+/// Uses sender as session_id for additional backend-level isolation.
+/// This ensures User A's history cannot be accessed by User B even in
+/// the memory backend itself.
+async fn save_user_conversation_history(
+    memory: &dyn memory::Memory,
+    channel: &str,
+    sender: &str,
+    history: &[providers::ChatMessage],
+) -> Result<()> {
+    if history.is_empty() {
+        return Ok(());
+    }
+
+    // Trim to max size before saving
+    let to_save: Vec<providers::ChatMessage> = history
+        .iter()
+        .rev()
+        .take(MAX_DISCORD_CONVERSATION_HISTORY)
+        .cloned()
+        .collect();
+
+    let key = conversation_storage_key(channel, sender);
+    let json =
+        serde_json::to_string(&to_save).context("Failed to serialize conversation history")?;
+
+    // CRITICAL: Use sender as session_id for backend-level isolation
+    memory
+        .store(
+            &key,
+            &json,
+            memory::MemoryCategory::Conversation,
+            Some(sender), // session_id ensures per-user backend isolation
+        )
+        .await
+        .context("Failed to store conversation history")
+}
+
+/// Load conversation history from memory backend (user-isolated).
+///
+/// Only loads history for this specific user. Uses session_id filter
+/// to prevent cross-user data leakage.
+async fn load_user_conversation_history(
+    memory: &dyn memory::Memory,
+    channel: &str,
+    sender: &str,
+) -> Result<Vec<providers::ChatMessage>> {
+    let key = conversation_storage_key(channel, sender);
+
+    // CRITICAL: Use session_id filter to ensure we only get this user's data
+    if let Some(entry) = memory.get(&key).await? {
+        // Verify the entry belongs to this user (defensive check)
+        if entry.session_id.as_deref() != Some(sender) {
+            tracing::error!(
+                "Session ID mismatch for key {}: expected {}, got {:?}",
+                key,
+                sender,
+                entry.session_id
+            );
+            return Ok(Vec::new());
+        }
+
+        serde_json::from_str(&entry.content).context("Failed to parse conversation history")
+    } else {
+        Ok(Vec::new()) // No history found for this user
+    }
 }
 
 fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
@@ -1525,6 +1605,78 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+
+    // Check if we need to load history (first message from this user after restart)
+    let should_load_history = {
+        let map = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        !map.contains_key(&history_key)
+    };
+
+    if should_load_history {
+        // Check if this channel has load_past_conversations configured
+        let load_limit = match msg.channel.as_str() {
+            "discord" => ctx
+                .channels_config
+                .as_ref()
+                .and_then(|c| c.discord.as_ref())
+                .map(|d| d.load_past_conversations)
+                .unwrap_or(0),
+            _ => 0, // Can extend to other channels later
+        };
+
+        if load_limit > 0 {
+            tracing::info!(
+                "Loading conversation history for user {} on channel {} (limit: {})",
+                msg.sender,
+                msg.channel,
+                load_limit
+            );
+
+            // Load this user's past conversation history (isolated by user_id)
+            match load_user_conversation_history(&*ctx.memory, &msg.channel, &msg.sender).await {
+                Ok(loaded) => {
+                    if !loaded.is_empty() {
+                        // Take only the most recent 'load_limit' messages
+                        let to_restore: Vec<ChatMessage> =
+                            loaded.into_iter().rev().take(load_limit).collect();
+
+                        let mut map = ctx
+                            .conversation_histories
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+
+                        let to_restore_len = to_restore.len();
+                        map.entry(history_key.clone())
+                            .or_insert_with(Vec::new)
+                            .extend(to_restore);
+
+                        tracing::info!(
+                            "Loaded {} past messages for user {} ({})",
+                            to_restore_len,
+                            &msg.sender,
+                            &msg.channel
+                        );
+                    } else {
+                        tracing::debug!(
+                            "No past conversation history found for user {}",
+                            msg.sender
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load conversation history for user {}: {}",
+                        msg.sender,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
@@ -1866,6 +2018,35 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Save updated conversation history for this user (isolated)
+            let current_history = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&history_key)
+                .cloned()
+                .unwrap_or_default();
+
+            // Only save Discord history for now (can extend to other channels later)
+            if msg.channel == "discord" {
+                if let Err(e) = save_user_conversation_history(
+                    &*ctx.memory,
+                    &msg.channel,
+                    &msg.sender,
+                    &current_history,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Failed to save conversation history for user {} on {}: {}",
+                        msg.sender,
+                        msg.channel,
+                        e
+                    );
+                }
+            }
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
@@ -3275,6 +3456,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             None
         },
         non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
+        channels_config: Some(config.channels_config.clone()),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -3488,6 +3670,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3537,6 +3720,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -3589,6 +3773,7 @@ mod tests {
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -4062,6 +4247,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4121,6 +4307,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
         });
@@ -4196,6 +4383,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4255,6 +4443,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4323,6 +4512,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4412,6 +4602,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4483,6 +4674,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4569,6 +4761,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4640,6 +4833,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4700,6 +4894,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -4871,6 +5066,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4951,6 +5147,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5043,6 +5240,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -5117,6 +5315,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -5176,6 +5375,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -5692,6 +5892,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -5777,6 +5978,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -5862,6 +6064,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(
@@ -6411,6 +6614,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -6477,6 +6681,7 @@ This is an example JSON object for profile settings."#;
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
+            channels_config: None,
         });
 
         process_channel_message(

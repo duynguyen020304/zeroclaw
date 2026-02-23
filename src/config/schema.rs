@@ -2657,6 +2657,15 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// Number of past messages to load per user on startup (0 = disabled).
+    /// Each user's conversation history is stored separately with strict isolation.
+    #[serde(default = "default_load_past_conversations")]
+    pub load_past_conversations: usize,
+}
+
+/// Default value for `load_past_conversations` (disabled).
+fn default_load_past_conversations() -> usize {
+    0
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -5082,11 +5091,13 @@ tool_dispatcher = "xml"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            load_past_conversations: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.bot_token, "discord-token");
         assert_eq!(parsed.guild_id.as_deref(), Some("12345"));
+        assert_eq!(parsed.load_past_conversations, 0);
     }
 
     #[test]
@@ -5097,6 +5108,7 @@ tool_dispatcher = "xml"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            load_past_conversations: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -5324,6 +5336,17 @@ guild_id = "123"
         let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.bot_token, "tok");
+        assert_eq!(parsed.load_past_conversations, 0);
+    }
+
+    #[test]
+    async fn discord_config_load_past_conversations() {
+        let toml_str = r#"
+bot_token = "tok"
+load_past_conversations = 20
+"#;
+        let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.load_past_conversations, 20);
     }
 
     #[test]
