@@ -1606,6 +1606,9 @@ async fn process_channel_message(
 
     let history_key = conversation_history_key(&msg);
 
+    // Track if we loaded past conversation history from persistence
+    let mut loaded_past_conversation = false;
+
     // Check if we need to load history (first message from this user after restart)
     let should_load_history = {
         let map = ctx
@@ -1652,6 +1655,8 @@ async fn process_channel_message(
                         map.entry(history_key.clone())
                             .or_insert_with(Vec::new)
                             .extend(to_restore);
+                        // Mark that we loaded past conversation
+                        loaded_past_conversation = true;
 
                         tracing::info!(
                             "Loaded {} past messages for user {} ({})",
@@ -1749,6 +1754,15 @@ async fn process_channel_message(
     let system_prompt = build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+
+    // Add marker if this is restored past conversation
+    if loaded_past_conversation {
+        history.push(ChatMessage::system(
+            "NOTE: The above conversation history was restored from a previous session. \
+             This is past conversation that you have had with this user. Treat it as context, \
+             but focus on responding to their current message below.",
+        ));
+    }
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
